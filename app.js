@@ -1,8 +1,8 @@
 const fs = require('fs');
-var fat = fs.readFileSync(__dirname + '/fat_test.bin');
+var fat = fs.readFileSync(__dirname + '/fat_test2.bin');
 
 function readBuffer(offset, bytes, reverse=true){
-	var sa = fat.subarray(offset, offset+bytes)
+	var sa = [...fat.subarray(offset, offset+bytes)]
 	return reverse ? sa.reverse() : sa;
 }
 
@@ -41,57 +41,110 @@ function readAscii(offset, bytes){
 	return buffToAscii(read)
 }
 
+function parseLFN(data){
+	var name1 = [...data.slice(1, 11)];
+	var name2 = [...data.slice(14, 14+12)];
+	var name3 = [...data.slice(28, 28+4)];
+	return [...name1, ...name2, ...name3].filter(a=>a!=0x00 && a!=0xFF);
+}
+
+
 var numOfSectors = readInt(32, 4);
-var bytesPerSector = readInt(11, 2);
 var sectorsPerCluster = readInt(13, 1);
+var bytesPerSector = readInt(11, 2);
 var rootCluster = readInt(44, 4);
 var reservedSectors = readInt(0x0E, 2);
 var numberOfFAT = readInt(0x10, 1);
 var sectorsPerFat = readInt(0x024, 4);
 
-var FATSector = reservedSectors;
-
 var clusterToSector = (n)=>(n-2)*sectorsPerCluster + reservedSectors+(numberOfFAT*sectorsPerFat);
+var sectorToCluster = (s)=>((s-(numberOfFAT*sectorsPerFat)-reservedSectors)/sectorsPerCluster)+2
 
+var maxClusters = sectorToCluster(numOfSectors);
 var rootSector = clusterToSector(rootCluster);
-var dir = 0;
-while(true){
-	var itemDir = rootSector*bytesPerSector+(dir*32);
-	var item = readBuffer(itemDir, 32, false);
-	if(item[0]==0x00) break;
 
-	if(item[11]!=0x20){
-		dir += 1;
-		continue;
-	}
-	if(item[11]==0x0F){
-		console.log("LONG NAME");
-	}
-	var fileSize = readInt(itemDir+28, 4);
-	var name = readAscii(itemDir, 11)
-	var firstClustHigh = readHex(itemDir+20, 2);
-	var firstClustLow = readHex(itemDir+26, 2);
-	var firstClust = parseInt(`${firstClustHigh}${firstClustLow}`, 16);
-	var fileSectorStart = clusterToSector(firstClust)*bytesPerSector;
+var getClusterFAT = (c)=>(c*4)%bytesPerSector;
 
-	var crtDate = readBinary(itemDir+16, 2);
-	var date = {
-		year: 1980 + parseInt(crtDate.substr(0, 7), 2),
-		month: parseInt(crtDate.substr(7, 4), 2),
-		day: parseInt(crtDate.substr(11, 5), 2)
+function getNextCluster(cluster){
+	var clusterFAT = (cluster*4) % bytesPerSector;
+	var fatVal = readInt((reservedSectors*bytesPerSector)+clusterFAT, 4, false);
+	if(fatVal>maxClusters){
+		console.log("NO NEXT CLUSTER");
+		return false;
 	}
-
-	var crtTime = readBinary(itemDir+14, 2);
-	var time = {
-		hour: parseInt(crtTime.substr(0, 5), 2),
-		min: parseInt(crtTime.substr(5, 6), 2),
-		sec: parseInt(crtTime.substr(11, 5), 2)*2
-	}
-	
-	console.log(name.substr(0, 8).trim()+'.'+name.substr(-3))
-	console.log(" => File Size:\t\t", fileSize, 'Bytes');
-	console.log(" => Byte Offset:\t", fileSectorStart);
-	console.log(" => Creation:\t\t", `${date.year}-${date.month}-${date.day}`)
-	console.log(" => Creation Time:\t", `${('00'+time.hour).slice(-2)}:${('00'+time.min).slice(-2)}:${('00'+time.sec).slice(-2)}`)
-	dir += 1;
+	return fatVal+cluster
+	// console.log(fatVal);
 }
+
+
+var rootClusterFAT = readInt(reservedSectors*bytesPerSector+getClusterFAT(rootCluster), 4);
+// console.log(hasNextCluster(rootCluster), getClusterFAT(rootCluster))
+// console.log(rootClusterFAT.toString(16), "ROOT NEXT SECTOR", ((rootClusterFAT & 0x0FFFFFFF)*sectorsPerCluster)+rootSector-2)
+var dir = 0;
+
+function readSectorDir(sector){
+	while(true){
+		var itemDir = sector*bytesPerSector+(dir*32);
+		var item = readBuffer(itemDir, 32, false);
+		var attr = item[11];
+		if(item[0]==0x00){
+			// var currentCluster = sectorToCluster(((itemDir-(dir*32))/bytesPerSector));
+			// var nextCluster = getNextCluster(currentCluster);
+			// console.log(sector+nextCluster);
+			
+			// if(nextCluster!==false){
+			// 	sector = sector+clusterToSector(nextCluster)
+			// 	dir = 0;
+			// 	continue;
+			// }else break;
+			break;
+		}
+		var name = "", extension = "", lfn = false;
+		if(attr!=0x0F){
+			name = readAscii(itemDir, 8)
+			extension = readAscii(itemDir+8, 3);
+		}
+		while(attr==0x0F){
+			lfn = true;
+			name = buffToAscii(parseLFN(item)) + name;
+			dir += 1;
+			itemDir = rootSector*bytesPerSector+(dir*32);
+			item = readBuffer(itemDir, 32, false);
+			attr = item[11];
+		}
+		if(attr!=0x20){
+			dir += 1;
+			continue;
+		}
+		
+		var fileSize = readInt(itemDir+28, 4);
+		var firstClustHigh = readInt(itemDir+20, 2);
+		var firstClustLow = readInt(itemDir+26, 2);
+		var firstClust = (firstClustHigh << 16) + firstClustLow
+		var fileSectorStart = clusterToSector(firstClust)*bytesPerSector;
+	
+		var crtDate = readBinary(itemDir+16, 2);
+		var date = {
+			year: 1980 + parseInt(crtDate.substr(0, 7), 2),
+			month: parseInt(crtDate.substr(7, 4), 2),
+			day: parseInt(crtDate.substr(11, 5), 2)
+		}
+	
+		var crtTime = readBinary(itemDir+14, 2);
+		var time = {
+			hour: parseInt(crtTime.substr(0, 5), 2),
+			min: parseInt(crtTime.substr(5, 6), 2),
+			sec: parseInt(crtTime.substr(11, 5), 2)*2
+		}
+		console.log(lfn ? name : name.trim()+'.'+extension.trim())
+		console.log(" => File Size:\t\t", fileSize, 'Bytes');
+		console.log(" => Attribute:\t\t", ('00'+attr.toString(16).toUpperCase()).slice(-2));
+		console.log(" => Sector:\t\t", clusterToSector(firstClust));
+		console.log(" => Byte Offset:\t", fileSectorStart);
+		console.log(" => Creation:\t\t", `${date.year}-${date.month}-${date.day}`)
+		console.log(" => Creation Time:\t", `${('00'+time.hour).slice(-2)}:${('00'+time.min).slice(-2)}:${('00'+time.sec).slice(-2)}`)
+		dir += 1;
+	}
+}
+
+readSectorDir(rootSector);
